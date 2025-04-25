@@ -1,0 +1,7 @@
+# Ignore non-code files
+*.md
+LICENSE
+*.json
+
+# Ignore IDE/editor files
+.vscode/

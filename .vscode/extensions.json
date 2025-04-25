@@ -1,0 +1,7 @@
+{
+    "recommendations": [
+        "oderwat.indent-rainbow",
+        "esbenp.prettier-vscode",
+        "davidanson.vscode-markdownlint"
+    ]
+}
