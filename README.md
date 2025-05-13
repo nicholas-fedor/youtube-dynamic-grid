@@ -30,6 +30,7 @@ This is a script that I use personally, so your mileage may vary; however, you s
    - Visit [YouTube](https://www.youtube.com/) in your browser.
    - The script will automatically adjust the video grid based on your window size.
    - Resize your browser window to see the grid dynamically adapt.
+   - Enable debug logging by appending `?debug=1` to the URL (e.g., `https://www.youtube.com/?debug=1`).
 
 ## Features
 
@@ -49,6 +50,16 @@ This is a script that I use personally, so your mileage may vary; however, you s
 - The script runs automatically on YouTube pages (`*://www.youtube.com/*` and `*://youtube.com/*`).
 - No configuration is required; the grid adjusts based on your browser window's width.
 - For optimal performance, avoid running multiple grid-modifying scripts simultaneously.
+
+## Parameters
+
+- `videoWidth`: 340px (thumbnail width, tuned for ~9 items on 3440x1440)
+- `margin`: 40px (total left/right margins)
+- `gap`: 10px (spacing between thumbnails)
+
+## Limitations
+
+May require parameter adjustments for different monitor sizes. File issues at [support](https://github.com/nicholas-fedor/youtube-dynamic-grid/issues).
 
 ## Contributing
 
