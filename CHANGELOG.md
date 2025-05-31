@@ -4,6 +4,21 @@ All notable changes to the YouTube Dynamic Video Grid project will be documented
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2025-05-30
+
+### Fixed
+
+- Resolved video grid overlap with playlist info section on playlist pages by skipping script execution and removing residual CSS/styles.
+- Fixed navigation issue where the script failed to apply after transitioning to/from playlist pages without requiring a full page refresh.
+
+### Changed
+
+- Refactored codebase for improved maintainability, introducing `GridManager` and `NavigationManager` modules to encapsulate grid and navigation logic.
+- Enhanced logging with categorized levels (`info`, `debug`, `error`) and reduced verbosity for clearer debugging output.
+- Reorganized code into logical sections (Constants, Utilities, Grid Management, Navigation, Initialization) with a centralized `CONFIG` object for constants.
+- Improved commenting with JSDoc documentation and inline explanations to enhance code clarity and future maintenance.
+- Adopted JavaScript best practices, including `const` for immutable variables, consistent error handling, and performance optimizations (e.g., reduced polling frequency).
+
 ## [1.0.1] - 2025-05-13
 
 ### Added
