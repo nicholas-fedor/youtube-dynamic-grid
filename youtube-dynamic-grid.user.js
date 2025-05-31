@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Dynamic Video Grid
 // @namespace    https://github.com/nicholas-fedor/youtube-dynamic-grid
-// @version      1.0.1
+// @version      1.0.2
 // @description  Dynamically adjusts the YouTube video grid to display an optimal number of videos per row based on window width, overriding the default 3-video grid for a more responsive layout
 // @author       Nick Fedor
 // @match        *://www.youtube.com/*
@@ -16,372 +16,446 @@
 // @run-at       document-end
 // ==/UserScript==
 
+/**
+ * YouTube Dynamic Video Grid Tampermonkey script.
+ * Adjusts the YouTube video grid to display 3-12 videos per row based on window width.
+ * Skips execution on playlist pages to prevent layout overlap.
+ * Version history:
+ * - 1.0.2 (2025-05-30): Fixed playlist overlap, improved navigation handling, refactored for maintainability.
+ * - 1.0.1 (2025-05-13): Added SPA navigation, CSP compliance, optimized polling.
+ * - 1.0.0 (2024-04-25): Initial release.
+ */
+
 (function () {
   'use strict';
 
+  // Configuration constants
+  const CONFIG = {
+    VIDEO_WIDTH: 340, // Thumbnail width in pixels
+    MARGIN: 40, // Total left/right margins in pixels
+    GAP: 10, // Spacing between thumbnails in pixels
+    MIN_ITEMS: 3, // Minimum items per row
+    MAX_ITEMS: 12, // Maximum items per row
+    NAVIGATION_POLL_INTERVAL: 500, // Navigation polling interval in ms
+    GRID_POLL_INTERVALS: { early: 200, regular: 1000 }, // Polling intervals in ms
+    POLLING_DURATIONS: { early: 5000, regular: 25000 }, // Polling durations in ms
+    DEBOUNCE_DELAY: 100, // Debounce delay for navigation and resize in ms
+    UPDATE_DELAY: 50, // Debounce delay for grid updates in ms
+    RETRY_ATTEMPTS: 20, // Grid update retry attempts
+    RETRY_INTERVAL: 100, // Retry interval in ms
+    STABLE_COUNT: 5, // Number of stable checks to stop polling
+  };
+
+  // Utility Functions
   /**
-   * Logs messages to the console for debugging when enabled via ?debug=1 query parameter
+   * Checks if the current page is a YouTube playlist page.
+   * @returns {boolean} True if URL starts with /playlist
+   */
+  const isPlaylistPage = () => window.location.pathname.startsWith('/playlist');
+
+  /**
+   * Logs messages to the console based on debug mode and log level.
    * @param {string} message - Message to log
-   * @param {boolean} [force=false] - Forces logging regardless of debug mode
+   * @param {'info' | 'debug' | 'error'} [level='info'] - Log level
    */
-  function log(message, force = false) {
-    if (force || window.location.search.includes('debug=1')) {
-      console.log(`[YouTube Dynamic Grid] ${message}`);
+  const logger = (message, level = 'info') => {
+    const isDebug = window.location.search.includes('debug=1');
+    if (
+      level === 'error' ||
+      (isDebug && (level === 'info' || level === 'debug'))
+    ) {
+      console[level === 'error' ? 'error' : 'log'](
+        `[YouTube Dynamic Grid][${level}] ${message}`
+      );
     }
-  }
+  };
 
-  /**
-   * Calculates the number of items per row based on the container width
-   * @returns {number} Number of items per row, capped between 3 and 12
-   */
-  function calculateItemsPerRow() {
-    // Select the grid container or fallback to document.body
-    const container =
-      document.querySelector('#contents') ||
-      document.querySelector('ytd-two-column-browse-results-renderer') ||
-      document.body;
-    const width = container.getBoundingClientRect().width || window.innerWidth;
-    const videoWidth = 340; // Estimated thumbnail width in pixels
-    const margin = 40; // Total left and right margins in pixels
-    const gap = 10; // Gap between thumbnails in pixels
-    const firstColumnExtraMargin = 0; // Normalized by CSS, no extra margin
-    // Round to nearest integer to balance item count and space usage
-    let itemsPerRow = Math.round(
-      (width - margin - firstColumnExtraMargin) / (videoWidth + gap)
-    );
-    // Cap items between 3 and 12 for layout consistency
-    return Math.max(3, Math.min(12, itemsPerRow));
-  }
+  // Grid Management Functions
+  const GridManager = {
+    /**
+     * Calculates the number of items per row based on container width.
+     * @returns {number} Number of items per row (3-12)
+     */
+    calculateItemsPerRow() {
+      const container = document.querySelector(
+        '#contents, ytd-two-column-browse-results-renderer, body'
+      );
+      if (!container) {
+        logger('No container found for grid calculation', 'error');
+        return CONFIG.MIN_ITEMS;
+      }
+      const width =
+        container.getBoundingClientRect().width || window.innerWidth;
+      const items = Math.round(
+        (width - CONFIG.MARGIN) / (CONFIG.VIDEO_WIDTH + CONFIG.GAP)
+      );
+      return Math.max(CONFIG.MIN_ITEMS, Math.min(CONFIG.MAX_ITEMS, items));
+    },
 
-  /**
-   * Updates the grid's elements-per-row attribute and CSS styles with debouncing
-   */
-  let updateTimeout = null;
-  function updateGrid() {
-    clearTimeout(updateTimeout);
-    updateTimeout = setTimeout(() => {
-      try {
-        const grid = document.querySelector(
-          'ytd-rich-grid-renderer:not([hidden])'
-        );
-        if (grid) {
-          const width =
-            document.querySelector('#contents')?.getBoundingClientRect()
-              .width || window.innerWidth;
-          const itemsPerRow = calculateItemsPerRow();
+    /**
+     * Updates the grid's elements-per-row attribute and CSS styles.
+     */
+    updateGrid() {
+      if (this.updateTimeout) clearTimeout(this.updateTimeout);
+      this.updateTimeout = setTimeout(() => {
+        try {
+          const grid = document.querySelector(
+            'ytd-rich-grid-renderer:not([hidden])'
+          );
+          if (!grid) {
+            logger('No visible grid found');
+            return;
+          }
+          const itemsPerRow = this.calculateItemsPerRow();
           const currentItems = getComputedStyle(grid)
             .getPropertyValue('--ytd-rich-grid-items-per-row')
             .trim();
           const currentAttr =
             grid.getAttribute('elements-per-row') || 'unknown';
-          // Update only if item count or attribute differs
           if (
             currentItems !== String(itemsPerRow) ||
             currentAttr !== String(itemsPerRow)
           ) {
-            // Set Polymer attribute to align with CSS
             grid.setAttribute('elements-per-row', itemsPerRow);
-            updateCSS(itemsPerRow);
-            log(
-              `Updated items per row to ${itemsPerRow} (was ${currentItems}, attr ${currentAttr}) for width ${width}px`,
-              true
-            );
+            this.updateCSS(itemsPerRow);
+            logger(`Updated grid to ${itemsPerRow} items`);
           }
-        } else {
-          log('No visible grid found');
+        } catch (error) {
+          logger(`Failed to update grid: ${error.message}`, 'error');
         }
-      } catch (error) {
-        log(`Error updating grid: ${error.message}`);
-      }
-    }, 50); // Debounce updates by 50ms to prevent rapid calls
-  }
+      }, CONFIG.UPDATE_DELAY);
+    },
 
-  /**
-   * Injects a dynamic CSS style element to override grid layout
-   */
-  function injectCSS() {
-    let style = document.getElementById('dynamic-grid-style');
-    if (!style) {
-      style = document.createElement('style');
-      style.id = 'dynamic-grid-style';
-      // Apply CSP nonce if available to comply with YouTube's security policy
-      const nonce = document.querySelector('meta[name="csp-nonce"]')?.content;
-      if (nonce) style.nonce = nonce;
-      document.head.appendChild(style);
-      log('Injected dynamic CSS rule with nonce', true);
-      const itemsPerRow = calculateItemsPerRow();
+    /**
+     * Injects or updates the CSS style element for the grid.
+     */
+    injectCSS() {
+      if (isPlaylistPage()) {
+        logger('Skipping CSS injection on playlist page');
+        this.removeCSS();
+        return;
+      }
+      let style = document.getElementById('dynamic-grid-style');
+      if (!style) {
+        style = document.createElement('style');
+        style.id = 'dynamic-grid-style';
+        const nonce = document.querySelector('meta[name="csp-nonce"]')?.content;
+        if (nonce) style.nonce = nonce;
+        document.head.appendChild(style);
+        logger('Injected CSS style element', 'debug');
+      }
+      this.updateCSS(this.calculateItemsPerRow());
+    },
+
+    /**
+     * Updates the CSS rule for the specified number of items per row.
+     * @param {number} itemsPerRow - Number of items per row
+     */
+    updateCSS(itemsPerRow) {
+      const style = document.getElementById('dynamic-grid-style');
+      if (!style) return;
       style.textContent = `
         #contents, ytd-two-column-browse-results-renderer {
           max-width: 100% !important;
           width: 100% !important;
           padding: 0 !important;
         }
-        ytd-rich-grid-renderer {
+        ytd-rich-grid-renderer:not([hidden]) {
           --ytd-rich-grid-items-per-row: ${itemsPerRow} !important;
           --ytd-rich-grid-posts-per-row: ${itemsPerRow} !important;
           max-width: 100% !important;
           padding: 0 !important;
-          gap: 10px !important; /* Consistent horizontal and vertical spacing */
+          gap: ${CONFIG.GAP}px !important;
         }
-        ytd-rich-grid-renderer [is-in-first-column] {
+        ytd-rich-grid-renderer:not([hidden]) [is-in-first-column] {
           margin-left: 8px !important;
           margin-right: 8px !important;
-          margin-bottom: 16px !important; /* Vertical spacing for first-column items */
+          margin-bottom: 16px !important;
         }
-        ytd-rich-item-renderer {
-          margin: 0 8px 16px 8px !important; /* Uniform margins with vertical spacing */
+        ytd-rich-grid-renderer:not([hidden]) ytd-rich-item-renderer {
+          margin: 0 8px 16px 8px !important;
         }
       `;
-    }
-  }
+    },
 
-  /**
-   * Updates the dynamic CSS rule with the specified number of items per row
-   * @param {number} itemsPerRow - Number of items per row
-   */
-  function updateCSS(itemsPerRow) {
-    const style = document.getElementById('dynamic-grid-style');
-    style.textContent = `
-      #contents, ytd-two-column-browse-results-renderer {
-        max-width: 100% !important;
-        width: 100% !important;
-        padding: 0 !important;
+    /**
+     * Removes the CSS style element and resets grid attributes.
+     */
+    removeCSS() {
+      const style = document.getElementById('dynamic-grid-style');
+      if (style) {
+        style.remove();
+        logger('Removed CSS style element', 'debug');
       }
-      ytd-rich-grid-renderer:not([hidden]) {
-        --ytd-rich-grid-items-per-row: ${itemsPerRow} !important;
-        --ytd-rich-grid-posts-per-row: ${itemsPerRow} !important;
-        max-width: 100% !important;
-        padding: 0 !important;
-        gap: 10px !important;
+      const grid = document.querySelector('ytd-rich-grid-renderer');
+      if (grid) {
+        grid.removeAttribute('elements-per-row');
+        grid.style.removeProperty('--ytd-rich-grid-items-per-row');
+        grid.style.removeProperty('--ytd-rich-grid-posts-per-row');
+        logger('Reset grid attributes', 'debug');
       }
-      ytd-rich-grid-renderer:not([hidden]) [is-in-first-column] {
-        margin-left: 8px !important;
-        margin-right: 8px !important;
-        margin-bottom: 16px !important;
-      }
-      ytd-rich-grid-renderer:not([hidden]) ytd-rich-item-renderer {
-        margin: 0 8px 16px 8px !important;
-      }
-    `;
-  }
+    },
 
-  /**
-   * Attempts to update the grid with retries until the grid is visible
-   * @param {number} [attempts=20] - Number of retry attempts
-   * @param {number} [interval=100] - Retry interval in milliseconds
-   */
-  function tryUpdateGrid(attempts = 20, interval = 100) {
-    updateGrid();
-    if (
-      attempts > 0 &&
-      !document.querySelector('ytd-rich-grid-renderer:not([hidden])')
-    ) {
-      log(`Retrying grid update (${attempts} attempts left)`);
-      setTimeout(() => tryUpdateGrid(attempts - 1, interval), interval);
-    }
-  }
+    /**
+     * Attempts to update the grid with retries.
+     * @param {number} [attempts=CONFIG.RETRY_ATTEMPTS] - Retry attempts
+     */
+    tryUpdate(attempts = CONFIG.RETRY_ATTEMPTS) {
+      if (isPlaylistPage()) {
+        logger('Skipping grid update on playlist page');
+        this.removeCSS();
+        return;
+      }
+      this.updateGrid();
+      if (
+        attempts > 0 &&
+        !document.querySelector('ytd-rich-grid-renderer:not([hidden])')
+      ) {
+        logger(`Retrying grid update (${attempts} attempts left)`, 'debug');
+        setTimeout(() => this.tryUpdate(attempts - 1), CONFIG.RETRY_INTERVAL);
+      }
+    },
 
-  /**
-   * Initializes or reinitializes the MutationObserver to monitor grid changes
-   */
-  let observer = null;
-  function startObserver() {
-    if (observer) {
-      observer.disconnect();
-      log('Disconnected previous observer');
-    }
-    observer = new MutationObserver(mutations => {
-      for (const mutation of mutations) {
-        if (
-          mutation.target.matches('ytd-rich-grid-renderer') ||
-          mutation.target.closest('ytd-rich-grid-renderer') ||
-          mutation.target.querySelector('ytd-rich-grid-renderer') ||
-          mutation.attributeName === 'style' ||
-          mutation.attributeName === 'hidden' ||
-          mutation.attributeName === 'class' ||
-          mutation.attributeName === 'elements-per-row' ||
-          mutation.addedNodes.length > 0
-        ) {
-          updateGrid();
-          break; // Exit after first relevant mutation to avoid redundant updates
+    /**
+     * Polls the grid for changes until stable.
+     * @param {'early' | 'regular'} mode - Polling mode
+     */
+    pollGrid(mode = 'early') {
+      if (isPlaylistPage()) {
+        logger(`Skipping ${mode} polling on playlist page`);
+        this.removeCSS();
+        return;
+      }
+      if (this.pollInterval) clearInterval(this.pollInterval);
+      let stableCount = 0;
+      const interval = CONFIG.GRID_POLL_INTERVALS[mode];
+      const duration = CONFIG.POLLING_DURATIONS[mode];
+      this.pollInterval = setInterval(() => {
+        const grid = document.querySelector(
+          'ytd-rich-grid-renderer:not([hidden])'
+        );
+        if (grid) {
+          const currentItems = getComputedStyle(grid)
+            .getPropertyValue('--ytd-rich-grid-items-per-row')
+            .trim();
+          const currentAttr =
+            grid.getAttribute('elements-per-row') || 'unknown';
+          const itemsPerRow = this.calculateItemsPerRow();
+          if (
+            currentItems !== String(itemsPerRow) ||
+            currentAttr !== String(itemsPerRow)
+          ) {
+            this.updateGrid();
+            stableCount = 0;
+          } else {
+            stableCount++;
+            if (stableCount >= CONFIG.STABLE_COUNT) {
+              clearInterval(this.pollInterval);
+              logger(`Stopped ${mode} polling: grid stable`);
+              if (mode === 'early') this.pollGrid('regular');
+              else this.updateGrid();
+            }
+          }
         }
+      }, interval);
+      setTimeout(() => {
+        clearInterval(this.pollInterval);
+        logger(`Stopped ${mode} polling`);
+        if (mode === 'early') this.pollGrid('regular');
+        else this.updateGrid();
+      }, duration);
+    },
+
+    // Internal state
+    updateTimeout: null,
+    pollInterval: null,
+  };
+
+  // Navigation Management Functions
+  const NavigationManager = {
+    /**
+     * Handles navigation events by reinitializing the grid.
+     */
+    handleNavigation() {
+      if (this.navigationDebounce) clearTimeout(this.navigationDebounce);
+      this.navigationDebounce = setTimeout(() => {
+        this.navigationTimeouts.forEach(clearTimeout);
+        this.navigationTimeouts = [];
+        cleanup();
+        if (isPlaylistPage()) {
+          logger('Skipping grid initialization on playlist page');
+          GridManager.removeCSS();
+          return;
+        }
+        logger('Initializing grid for non-playlist page');
+        GridManager.injectCSS();
+        GridManager.tryUpdate();
+        this.startObserver();
+        GridManager.pollGrid();
+        this.navigationTimeouts.push(
+          setTimeout(() => GridManager.updateGrid(), 1000)
+        );
+        this.navigationTimeouts.push(
+          setTimeout(() => GridManager.updateGrid(), 5000)
+        );
+        this.navigationTimeouts.push(
+          setTimeout(() => GridManager.updateGrid(), 10000)
+        );
+        if (this.eventListeners) cleanup();
+        this.eventListeners = this.setupEventListeners();
+      }, CONFIG.DEBOUNCE_DELAY);
+    },
+
+    /**
+     * Monitors SPA navigation via URL polling.
+     */
+    monitorNavigation() {
+      setInterval(() => {
+        const currentUrl = location.href;
+        if (currentUrl !== this.lastUrl) {
+          this.lastUrl = currentUrl;
+          logger(`Navigated to ${currentUrl}`, 'debug');
+          this.handleNavigation();
+        }
+      }, CONFIG.NAVIGATION_POLL_INTERVAL);
+      logger('Started navigation polling', 'debug');
+    },
+
+    /**
+     * Starts the MutationObserver for grid changes.
+     */
+    startObserver() {
+      if (isPlaylistPage()) {
+        logger('Skipping observer start on playlist page');
+        GridManager.removeCSS();
+        return;
       }
-    });
-    const target =
-      document.querySelector('#contents') ||
-      document.querySelector('ytd-two-column-browse-results-renderer') ||
-      document.querySelector('ytd-app');
-    if (target) {
-      observer.observe(target, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ['style', 'class', 'hidden', 'elements-per-row'],
+      if (this.observer) {
+        this.observer.disconnect();
+        logger('Disconnected previous observer', 'debug');
+      }
+      this.observer = new MutationObserver(mutations => {
+        for (const mutation of mutations) {
+          if (
+            mutation.target.matches('ytd-rich-grid-renderer') ||
+            mutation.target.closest('ytd-rich-grid-renderer') ||
+            mutation.target.querySelector('ytd-rich-grid-renderer') ||
+            ['style', 'hidden', 'class', 'elements-per-row'].includes(
+              mutation.attributeName
+            ) ||
+            mutation.addedNodes.length > 0
+          ) {
+            GridManager.updateGrid();
+            break;
+          }
+        }
       });
-      log('Started observer on target');
-    } else {
-      log('Target not found, retrying observer');
-      setTimeout(startObserver, 100); // Retry after 100ms if target is missing
-    }
-  }
-
-  /**
-   * Handles navigation events by reinitializing the grid update and observer
-   */
-  let navigationTimeouts = [];
-  function handleNavigation() {
-    navigationTimeouts.forEach(clearTimeout);
-    navigationTimeouts = [];
-    tryUpdateGrid();
-    startObserver();
-    // Schedule delayed updates to catch late renders
-    navigationTimeouts.push(setTimeout(updateGrid, 1000));
-    navigationTimeouts.push(setTimeout(updateGrid, 5000));
-    navigationTimeouts.push(setTimeout(updateGrid, 10000));
-  }
-
-  /**
-   * Monitors SPA navigation via URL changes
-   */
-  let lastUrl = location.href;
-  new MutationObserver(() => {
-    const currentUrl = location.href;
-    if (currentUrl !== lastUrl) {
-      lastUrl = currentUrl;
-      log(`Detected navigation to ${currentUrl}`);
-      handleNavigation();
-    }
-  }).observe(document, { subtree: true, childList: true });
-
-  // Event handlers for cleanup
-  let resizeTimeout = null;
-  const resizeHandler = () => {
-    clearTimeout(resizeTimeout);
-    resizeTimeout = setTimeout(() => {
-      log('Window resized');
-      updateGrid();
-    }, 100); // Throttle resize events by 100ms
-  };
-  const loadHandler = () => {
-    log('Page loaded');
-    handleNavigation();
-  };
-  const popstateHandler = () => {
-    log('Detected popstate navigation');
-    handleNavigation();
-  };
-
-  /**
-   * Polls for grid changes with aggressive early polling to counter style overrides
-   */
-  let pollingInterval = null;
-  let stableCount = 0;
-  function startPolling() {
-    if (pollingInterval) {
-      clearInterval(pollingInterval);
-    }
-    pollingInterval = setInterval(() => {
-      const grid = document.querySelector(
-        'ytd-rich-grid-renderer:not([hidden])'
+      const target = document.querySelector(
+        '#contents, ytd-two-column-browse-results-renderer, ytd-app'
       );
-      if (grid) {
-        const currentItems = getComputedStyle(grid)
-          .getPropertyValue('--ytd-rich-grid-items-per-row')
-          .trim();
-        const currentAttr = grid.getAttribute('elements-per-row') || 'unknown';
-        const itemsPerRow = calculateItemsPerRow();
-        if (
-          currentItems !== String(itemsPerRow) ||
-          currentAttr !== String(itemsPerRow)
-        ) {
-          updateGrid();
-          stableCount = 0;
-        } else {
-          stableCount++;
-          if (stableCount >= 5) {
-            clearInterval(pollingInterval);
-            log('Stopped early polling: grid stable');
-            startRegularPolling();
-          }
-        }
+      if (target) {
+        this.observer.observe(target, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ['style', 'class', 'hidden', 'elements-per-row'],
+        });
+        logger('Started observer', 'debug');
+      } else {
+        logger('Observer target not found, retrying', 'debug');
+        setTimeout(() => this.startObserver(), CONFIG.RETRY_INTERVAL);
       }
-    }, 200); // Poll every 200ms for first 5 seconds
-    setTimeout(() => {
-      clearInterval(pollingInterval);
-      log('Stopped early polling');
-      startRegularPolling();
-    }, 5000);
-  }
+    },
+
+    /**
+     * Sets up event listeners for resize, load, and popstate.
+     * @returns {Object} Listener references
+     */
+    setupEventListeners() {
+      if (isPlaylistPage()) {
+        logger('Skipping event listener setup on playlist page');
+        return null;
+      }
+      const resizeHandler = () => {
+        clearTimeout(this.resizeTimeout);
+        this.resizeTimeout = setTimeout(() => {
+          logger('Window resized', 'debug');
+          if (!isPlaylistPage()) GridManager.updateGrid();
+        }, CONFIG.DEBOUNCE_DELAY);
+      };
+      const loadHandler = () => {
+        logger('Page loaded', 'debug');
+        this.handleNavigation();
+      };
+      const popstateHandler = () => {
+        logger('Popstate navigation detected', 'debug');
+        this.handleNavigation();
+      };
+      window.addEventListener('resize', resizeHandler);
+      window.addEventListener('load', loadHandler);
+      window.addEventListener('popstate', popstateHandler);
+      logger('Set up event listeners', 'debug');
+      return { resizeHandler, loadHandler, popstateHandler };
+    },
+
+    // Internal state
+    lastUrl: location.href,
+    observer: null,
+    navigationTimeouts: [],
+    navigationDebounce: null,
+    resizeTimeout: null,
+    eventListeners: null,
+  };
 
   /**
-   * Continues polling at a slower rate for additional stability
-   */
-  function startRegularPolling() {
-    if (pollingInterval) {
-      clearInterval(pollingInterval);
-    }
-    stableCount = 0;
-    pollingInterval = setInterval(() => {
-      const grid = document.querySelector(
-        'ytd-rich-grid-renderer:not([hidden])'
-      );
-      if (grid) {
-        const currentItems = getComputedStyle(grid)
-          .getPropertyValue('--ytd-rich-grid-items-per-row')
-          .trim();
-        const currentAttr = grid.getAttribute('elements-per-row') || 'unknown';
-        const itemsPerRow = calculateItemsPerRow();
-        if (
-          currentItems !== String(itemsPerRow) ||
-          currentAttr !== String(itemsPerRow)
-        ) {
-          updateGrid();
-          stableCount = 0;
-        } else {
-          stableCount++;
-          if (stableCount >= 5) {
-            clearInterval(pollingInterval);
-            log('Stopped regular polling: grid stable');
-            updateGrid();
-          }
-        }
-      }
-    }, 1000); // Poll every 1000ms for 25 seconds
-    setTimeout(() => {
-      clearInterval(pollingInterval);
-      log('Stopped regular polling');
-      updateGrid();
-    }, 25000);
-  }
-
-  /**
-   * Cleans up event listeners and intervals on page unload
+   * Cleans up all resources (observers, intervals, listeners).
    */
   function cleanup() {
-    if (observer) {
-      observer.disconnect();
-      observer = null;
+    if (NavigationManager.observer) {
+      NavigationManager.observer.disconnect();
+      NavigationManager.observer = null;
     }
-    if (pollingInterval) {
-      clearInterval(pollingInterval);
-      pollingInterval = null;
+    if (GridManager.pollInterval) {
+      clearInterval(GridManager.pollInterval);
+      GridManager.pollInterval = null;
     }
-    navigationTimeouts.forEach(clearTimeout);
-    clearTimeout(resizeTimeout);
-    clearTimeout(updateTimeout);
-    window.removeEventListener('resize', resizeHandler);
-    window.removeEventListener('load', loadHandler);
-    window.removeEventListener('popstate', popstateHandler);
-    log('Cleaned up listeners');
+    NavigationManager.navigationTimeouts.forEach(clearTimeout);
+    clearTimeout(NavigationManager.resizeTimeout);
+    clearTimeout(GridManager.updateTimeout);
+    clearTimeout(NavigationManager.navigationDebounce);
+    if (NavigationManager.eventListeners) {
+      window.removeEventListener(
+        'resize',
+        NavigationManager.eventListeners.resizeHandler
+      );
+      window.removeEventListener(
+        'load',
+        NavigationManager.eventListeners.loadHandler
+      );
+      window.removeEventListener(
+        'popstate',
+        NavigationManager.eventListeners.popstateHandler
+      );
+      NavigationManager.eventListeners = null;
+    }
+    logger('Cleaned up resources', 'debug');
   }
 
-  // Initialize the script
-  injectCSS();
-  tryUpdateGrid();
-  startObserver();
-  startPolling();
-  window.addEventListener('resize', resizeHandler);
-  window.addEventListener('load', loadHandler);
-  window.addEventListener('popstate', popstateHandler);
-  window.addEventListener('unload', cleanup);
+  /**
+   * Initializes the script.
+   */
+  function init() {
+    if (isPlaylistPage()) {
+      logger('Skipping initialization on playlist page', 'info');
+      GridManager.removeCSS();
+      NavigationManager.monitorNavigation();
+      return;
+    }
+    logger('Initializing script', 'info');
+    NavigationManager.monitorNavigation();
+    NavigationManager.handleNavigation();
+  }
+
+  // Start the script with a delay to ensure URL evaluation
+  setTimeout(init, CONFIG.DEBOUNCE_DELAY);
 })();
